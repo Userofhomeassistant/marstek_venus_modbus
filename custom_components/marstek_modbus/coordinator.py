@@ -3,6 +3,7 @@ Handles all sensor polling via Home Assistant DataUpdateCoordinator,
 with per-sensor intervals and optional skipping if not due.
 """
 
+import asyncio
 import logging
 from datetime import timedelta
 
@@ -82,6 +83,8 @@ class MarstekCoordinator(DataUpdateCoordinator):
         self._last_update_times: dict = {}
         # Timestamps of last successful writes per key (for post-write read suppression)
         self._last_write_times: dict = {}
+        # Timestamps when a read was last started per key (for stale-read detection)
+        self._read_start_times: dict = {}
         
         # Connection throttling to prevent endless retry attempts after repeated failures
         self._consecutive_failures = 0
@@ -267,7 +270,6 @@ class MarstekCoordinator(DataUpdateCoordinator):
 
         try:
             # 10 second timeout for individual reads to prevent hanging
-            import asyncio
             value = await asyncio.wait_for(
                 self.client.async_read_register(
                     register=sensor["register"],
@@ -538,6 +540,7 @@ class MarstekCoordinator(DataUpdateCoordinator):
 
             # Track that we're attempting a read
             attempted_reads += 1
+            self._read_start_times[key] = now
 
             # Attempt to read the sensor value from Modbus using helper function
             value = await self.async_read_value(sensor, key)
@@ -695,6 +698,18 @@ class MarstekCoordinator(DataUpdateCoordinator):
         # Defensive check
         if self.data is None:
             self.data = {}
+
+        # Discard any read result that was overtaken by a write during this cycle.
+        # If a write completed after the read for a key was started, the read
+        # observed a pre-write device state and must not overwrite the fresh write.
+        for _k in list(updated_data.keys()):
+            _read_start = self._read_start_times.get(_k)
+            _last_write = self._last_write_times.get(_k)
+            if _read_start and _last_write and _last_write > _read_start:
+                _LOGGER.debug(
+                    "Discarding stale read of '%s' — write completed after read started", _k
+                )
+                del updated_data[_k]
 
         # Update the coordinator's data
         self.data.update(updated_data)
